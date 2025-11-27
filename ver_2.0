@@ -1,0 +1,486 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+
+class KirchoffCircuitAnalyzer:
+    def __init__(self):
+        self.components = []  #储存电路元件
+        self.nodes = set()    #储存节点
+        self.meshes = []      #储存网孔
+        self.method = None    #分析方法
+        self.solution = {}    #储存求解结果
+    
+    def run_analysis(self):
+        """主分析流程"""
+        self.welcome()
+        self.input_circuit_interactive()
+        self.perprocess_and_identify_unknowns()
+        self.auto_determine_method()
+
+        if self.method == "mesh":
+            self.solve_mesh_analysis()
+        else:
+            self.solve_nodal_analysis()
+
+        self.post_processing()
+        self.visualize_results()
+
+    def welcome(self):
+        """显示欢迎信息和使用说明"""
+        print("=========交互式基尔霍夫定律分析计算器=========")
+        print("本程序将引导您逐步分析电路:")
+        print("1.输入电路拓扑与参数")
+        print("2.自动识别未知量")
+        print("3.选择分析方法（网孔/节点）")
+        print("4.求解线性方程组")
+        print("5.计算所有支路电流与电压")
+        print("6.可视化结果")
+        print("============================================")
+        input("按回车键以开始...")
+
+    def input_circuit_interactive(self):
+        """交互式输入电路拓扑与参数"""
+        print("\n步骤1：输入电路拓扑参数")
+        print("-" * 40)
+
+        #输入节点数量
+        while True:
+            try:
+                n_nodes = int(input("请输入电路节点数量（包括参考节点)(输入整数):"))
+                if n_nodes < 2:
+                    print("节点数量至少为2，否则无法构建电流方程组")
+                    continue
+                break
+            except ValueError:
+                print("请输入有效数字，半个节点是什么意思")
+
+        #创建节点
+        self.nodes = set(range(n_nodes))
+        print(f"已创建节点:{list(self.nodes)}")
+        print("节点0将被用作参考节点（接地）")
+
+        #输入元件
+        print("\n现在开始添加电路元件：")
+        print("可输入元件类型：R（电阻），V（电压源），I（电流源）")
+        print("输入格式：类型 节点1 节点2 参数值")
+
+        component_id = 1
+        while True:
+            print(f"\n---添加元件{component_id}---")
+
+            #选择元件类型
+            comp_type = input("请输入元件类型 (R/V/I) 或输入 'done' 完成添加: ").upper()
+            if comp_type == 'DONE':
+                if len(self.components) == 0:
+                    print("起码要有一个元件吧")
+                    continue
+                break
+            elif comp_type not in ['R','V','I']:
+                print("这个东西应该是不行，请输入合适的元件类型")
+                continue
+
+            #输入元件值
+            try:
+                value = float(input(f"请输入元件值({'Ω' if comp_type=='R' else 'V' if comp_type=='V' else 'A'}):"))
+                if value <= 0 and comp_type != 'V':
+                    print("元件值必须为正数")
+                    continue
+            except ValueError:
+                print("请输入有效数字")
+                continue
+
+            #输入连接节点
+            try:
+                node1 = int(input("请输入连接的第一个节点编号："))
+                node2 = int(input("请输入连接的第二个节点编号："))
+
+                if node1 not in self.nodes or node2 not in self.nodes:
+                    print("节点编号无效")
+                    continue
+                if node1 == node2:
+                    print("节点不能相同")
+                    continue
+            except ValueError:
+                print("请输入有效的节点编号")
+                continue
+        
+            #添加元件
+            comp_name = f"{comp_type}{component_id}"
+            self.components.append({
+                'type': comp_type,
+                'nodes': (node1,node2),
+                'value': value,
+                'name': comp_name
+            })
+                         
+
+            print(f"已添加{comp_name}:{comp_type}({node1} - {node2}) = {value}{'Ω'if comp_type=='R' else 'V' if comp_type=='V' else 'A'}")
+            component_id += 1
+
+        print(f"\n电路输入完成！共添加{len(self.components)}个元件")
+
+    def perprocess_and_identify_unknowns(self):
+        """预处理与未知量识别"""
+        print("\n步骤2：预处理与未知量识别")
+        print("-" * 40)
+
+        #识别网孔（简化）
+        self.identify_meshes()
+        print(f"识别到{len(self.meshes)}个网孔")
+
+        #识别独立节点
+        independent_nodes = sorted(self.nodes - {0}) #除去参考节点
+        print(f"识别到{len(independent_nodes)}个独立节点")
+
+        #识别未知量
+        n_mesh_unknowns = len(self.meshes)
+        n_nodal_unknowns = len(independent_nodes)
+
+        print(f"网孔分析法未知量数:{n_mesh_unknowns}（网孔电流）")
+        print(f"节点分析法未知量数:{n_nodal_unknowns}(节点电压)")
+
+    def auto_determine_method(self):
+        """系统自动判断分析方法"""
+        print("\n步骤3:系统自动判断分析方法")
+        print("-" * 40)
+
+        n_meshes = len(self.meshes)
+        n_independent_nodes = len(self.nodes) - 1  #除去参考节点
+
+        #简单启发式规则
+        if n_meshes <= n_independent_nodes:
+            self.method = "mesh"
+            reason = f"网孔数({n_meshes})<=独立节点数({n_independent_nodes})"
+        else:
+            self.method = "nodal"
+            reason = f"网孔数({n_meshes})>独立节点数({n_independent_nodes})"
+
+        print(f"选择分析方法：{self.method}分析法")
+        print(f"选择原因：{reason}")
+
+    def solve_mesh_analysis(self):
+        """网孔分析法：构建R和V矩阵，求解I"""
+        print("\n步骤4:网孔分析法")
+        print("-" * 40)
+
+        n = len(self.meshes)
+        R = np.zeros((n,n))  #电阻矩阵
+        V = np.zeros(n)      #电压向量
+
+        print("构建网孔电阻矩阵R和电压向量V：")
+
+        #填充R矩阵和V向量
+        for i,mesh in enumerate(self.meshes):
+            print(f"\n处理网孔{i+1}:{mesh}")
+
+            #自电阻（对角线元素）
+            self_resistance = 0
+            for comp in self.components:
+                if comp['type'] == 'R' and self.is_component_in_mesh(comp,mesh):
+                    self_resistance += comp['value']
+                    print(f"  电阻{comp['name']}: +{comp['value']}Ω")
+
+            R[i,i] = self_resistance
+            print(f"  自电阻R{i+1}{i+1} = {self_resistance}Ω")
+
+            #互电阻（非对角线元素）
+            for j,other_mesh in enumerate(self.meshes):
+                if i != j:
+                    mutual_resistance = 0
+                    for comp in self.components:
+                        if comp['type'] == 'R' and self.is_component_shared(comp,mesh,other_mesh):
+                            mutual_resistance += comp['value']
+
+                    if mutual_resistance > 0:
+                        R[i,j] = -mutual_resistance
+                        print(f"  与网孔{j+1}的互电阻R{i+1}{j+1} = -{mutual_resistance}Ω")
+
+            #电压源贡献
+            voltage_sum = 0
+            for comp in self.components:
+                if comp['type'] == 'V' and self.is_component_in_mesh(comp,mesh):
+                    sign = self.determine_voltage_sign(comp,mesh)
+                    voltage_sum += sign * comp['value']
+                    print(f"  电压源{comp['name']}:{sign}×{comp['value']}V")
+
+            V[i] = voltage_sum
+            print(f"  电压和V{i+1} = {voltage_sum}V")
+
+        print(f"\n电阻矩阵 R:\n{R}")
+        print(f"电压向量V:{V}")
+
+        #求解线性方程组 R × V = I
+        try:
+            I = np.linalg.solve(R,V)
+            print(f"\n求解结果：网孔电流 I = {I}")
+
+            #存储结果
+            for i,current in enumerate(I):
+                self.solution[f'I_mesh_{i+1}'] = current
+        except np.linalg.LinAlgError:
+            print("错误：该矩阵无法求解")
+            return False
+        
+        return True
+    
+    def solve_nodal_analysis(self):
+        """节点分析法：构建G和I矩阵，求解U"""
+        print("\n步骤5:节点分析法")
+        print("-" * 40)
+
+        #独立节点
+        independent_nodes = sorted(self.nodes - {0})
+        n = len(independent_nodes)
+
+        #创建节点映射
+        node_map = {node:idx for idx, node in enumerate(independent_nodes)}
+
+        G = np.zeros((n,n))   #电导矩阵
+        I_vec = np.zeros(n)   #电流向量
+
+        print("构建节点电导矩阵G和电流源向量I：")
+
+        #填充G矩阵和I向量
+        for comp in self.components:
+            node1,node2 = comp['nodes']
+
+            if comp['type'] == 'R':
+                conductance = 1.0 / comp['value']
+
+                #更新G矩阵
+                if node1 != 0:   #不是参考点
+                    i = node_map[node1]
+                    G[i,i] += conductance
+                if node2 != 0:   #不是参考点
+                    j = node_map[node2]
+                    G[j,j] += conductance
+                if node1 != 0 and node2 != 0:     #两个都不是参考节点
+                    i,j = node_map[node1],node_map[node2]
+                    G[i,j] -= conductance
+                    G[j,i] -= conductance
+
+                print(f"  电阻{comp['name']}: 电导 = {conductance:.4f}S")
+
+            elif comp['type'] == 'I':
+                #电流源贡献向量
+                current = comp['value']
+                if node1 != 0:
+                    i = node_map[node1]
+                    I_vec[i] -= current   #流出节点
+
+                if node2 != 0:
+                    j = node_map[node2]
+                    I_vec[j] += current   #流入节点
+
+                print(f"  电流源 {comp['name']}: 电流 = {current}A")
+
+        print(f"\n电导矩阵 G:\n{G}")
+        print(f"电流向量 I: {I_vec}")
+
+        #求解线性方程组G × U = I
+        try:
+            U = np.linalg.solve(G,I_vec)
+            print(f"\n求解结果：节点电压U = {U}")
+
+
+            #存储结果
+            for i,voltage in enumerate(U):
+                self.solution[f'U_node_{independent_nodes[i]}'] = voltage
+        except np.linalg.LinAlgError:
+            print("错误：矩阵奇异，无法求解")
+            return False
+        
+        return True
+    
+    def post_processing(self):
+        """后处理：计算所有支路电流与电压"""
+        print("\n步骤6：后处理 - 计算所有支路电流与电压")
+        print("-" * 40)
+
+        if self.method == "mesh":
+            #基于网孔电路计算支路电流
+            for comp in self.components:
+                if comp['type'] == 'R':
+                    #计算流过电阻的电流
+                    current = 0
+                    for i, mesh in enumerate(self.meshes):
+                        if self.is_component_in_mesh(comp,mesh):
+                            sign = self.determine_current_direction(comp,mesh)
+                            mesh_current = self.solution[f'I_mesh_{i+1}']
+                            current += sign * mesh_current
+
+                    voltage = current * comp['value']
+                    self.solution[f'I_{comp["name"]}'] = current
+                    self.solution[f'U_{comp["name"]}'] = voltage
+                    print(f"{comp['name']}: I ={current:.4f}A,U = {voltage:.4f}V")
+
+        else:  #节点分析法
+            #基于节点电压计算支路电流和电压
+            for comp in self.components:
+                node1,node2 = comp['nodes']
+
+                #获取节点电压
+                u1 = 0 if node1 == 0 else self.solution.get(f'U_node_{node1}',0)
+                u2 = 0 if node2 == 0 else self.solution.get(f'U_node_{node2}',0)
+                voltage = u1 - u2
+
+                if comp['type'] == 'R':
+                    current = voltage / comp['value']
+                    self.solution[f'I_{comp["name"]}'] = current
+                    self.solution[f'U_{comp["name"]}'] = voltage
+                    print(f"{comp['name']}: I = {current:.4f}A,U = {voltage:.4f}V")
+
+    #以下内容在朋友帮助下共同完成
+    def visualize_results(self):
+        """可视化与结果输出"""
+        print("\n步骤7: 可视化与结果输出")
+        print("-" * 40)
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # 左侧：电路图
+        self.plot_circuit_diagram(ax1)
+        
+        # 右侧：结果表格
+        self.plot_results_table(ax2)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        print("\n分析完成！")
+
+    def plot_circuit_diagram(self, ax):
+        """绘制电路图"""
+        ax.set_title('电路图', fontsize=14, fontweight='bold')
+        ax.set_xlim(0, 10)
+        ax.set_ylim(0, 10)
+        ax.axis('off')
+        
+        # 简单电路图绘制
+        # 这里可以使用networkx或matplotlib绘制更复杂的电路图
+        # 简化实现：绘制节点和连接
+        
+        # 节点位置
+        node_positions = {}
+        n_nodes = len(self.nodes)
+        for i, node in enumerate(sorted(self.nodes)):
+            x = 2 + 6 * (i / max(1, n_nodes-1))
+            y = 5
+            node_positions[node] = (x, y)
+            
+            # 绘制节点
+            ax.plot(x, y, 'ro', markersize=10)
+            ax.text(x, y-0.5, f'Node {node}', ha='center', va='top')
+        
+        # 绘制元件
+        for comp in self.components:
+            node1, node2 = comp['nodes']
+            x1, y1 = node_positions[node1]
+            x2, y2 = node_positions[node2]
+            
+            # 选择颜色
+            color = 'red' if comp['type'] == 'V' else 'green' if comp['type'] == 'I' else 'blue'
+            
+            # 绘制连接线
+            ax.plot([x1, x2], [y1, y2], color=color, linewidth=2)
+            
+            # 添加标签
+            mid_x, mid_y = (x1+x2)/2, (y1+y2)/2
+            label = f"{comp['name']}\n{comp['value']}{'Ω' if comp['type']=='R' else 'V' if comp['type']=='V' else 'A'}"
+            ax.text(mid_x, mid_y+0.3, label, ha='center', va='center', 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+        
+        # 图例
+        ax.text(5, 9, f"分析方法: {self.method}分析法", ha='center', va='center', 
+            fontsize=12, fontweight='bold')
+        ax.text(5, 1, "图例: 蓝色=电阻, 红色=电压源, 绿色=电流源", ha='center', va='center',
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray"))
+
+    def plot_results_table(self, ax):
+        """绘制结果表格"""
+        ax.axis('off')
+        ax.set_title('分析结果', fontsize=14, fontweight='bold')
+        
+        # 准备表格数据
+        table_data = []
+        
+        if self.method == "mesh":
+            # 网孔电流结果
+            table_data.append(['网孔', '电流 (A)'])
+            for key, value in self.solution.items():
+                if key.startswith('I_mesh_'):
+                    mesh_num = key.split('_')[-1]
+                    table_data.append([f'网孔 {mesh_num}', f'{value:.4f}'])
+            
+            # 空行
+            table_data.append(['', ''])
+        
+        # 支路结果
+        table_data.append(['元件', '电流 (A)', '电压 (V)'])
+        for comp in self.components:
+            if comp['type'] == 'R':  # 只显示电阻的结果
+                current = self.solution.get(f'I_{comp["name"]}', 'N/A')
+                voltage = self.solution.get(f'U_{comp["name"]}', 'N/A')
+                
+                if current != 'N/A':
+                    current = f'{current:.4f}'
+                if voltage != 'N/A':
+                    voltage = f'{voltage:.4f}'
+                    
+                table_data.append([comp['name'], current, voltage])
+        
+        # 创建表格
+        table = ax.table(cellText=table_data, cellLoc='center', 
+                        loc='center', bbox=[0.1, 0.1, 0.8, 0.8])
+        
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1, 2)
+        
+        # 设置表头样式
+        for i in range(len(table_data[0])):
+            table[(0, i)].set_facecolor('lightgray')  
+
+    def identify_meshes(self):
+        """识别网孔（简化实现）"""
+        # 这是一个复杂问题，简化实现
+        # 实际应用中可能需要更复杂的图论算法
+        if len(self.nodes) >= 3:
+            # 简单识别：假设有基本网孔
+            # 实际应根据电路拓扑识别
+            self.meshes = [
+                [0, 1, 2, 0],  # 示例网孔1
+                [0, 2, 3, 0]   # 示例网孔2
+            ]
+
+    def is_component_in_mesh(self, comp, mesh):
+        """检查元件是否在网孔中（简化实现）"""
+        node1, node2 = comp['nodes']
+        # 简化检查：如果元件的两个节点都在网孔中且相邻
+        for i in range(len(mesh)):
+            if (mesh[i] == node1 and mesh[(i+1)%len(mesh)] == node2) or \
+            (mesh[i] == node2 and mesh[(i+1)%len(mesh)] == node1):
+                return True
+        return False
+
+    def is_component_shared(self, comp, mesh1, mesh2):
+        """检查元件是否是两个网孔的共享元件"""
+        return self.is_component_in_mesh(comp, mesh1) and self.is_component_in_mesh(comp, mesh2)
+
+    def determine_voltage_sign(self, comp, mesh):
+        """确定电压源符号（简化实现）"""
+        node1, node2 = comp['nodes']
+        for i in range(len(mesh)):
+            if mesh[i] == node1 and mesh[(i+1)%len(mesh)] == node2:
+                return 1  # 方向一致
+            elif mesh[i] == node2 and mesh[(i+1)%len(mesh)] == node1:
+                return -1  # 方向相反
+        return 1  # 默认
+
+    def determine_current_direction(self, comp, mesh):
+        """确定电流方向（简化实现）"""
+        return self.determine_voltage_sign(comp, mesh)
+
+if __name__ == "__main__":
+    analyzer = KirchoffCircuitAnalyzer()
+    analyzer.run_analysis()
